@@ -1,0 +1,34 @@
+{
+  "name": "browser-in-browser",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "3D のモニタ画面が生きたブラウザになっている Web アプリ。wasm エンジンまたは内蔵 canvas ブラウザを CanvasTexture として貼る。",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run typecheck && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "engine:link": "node scripts/link-engine.mjs",
+    "wisp": "node scripts/wisp-server.mjs",
+    "verify": "node verify/screen.mjs",
+    "verify:engine": "node verify/engine.mjs",
+    "verify:wisp": "node verify/wisp-e2e.mjs"
+  },
+  "dependencies": {
+    "@react-three/fiber": "^9.8.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "@mercuryworkshop/wisp-js": "^0.5.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/three": "^0.186.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "playwright-core": "^1.63.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1"
+  }
+}

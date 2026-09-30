@@ -1,0 +1,314 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0a0d;
+  --panel: rgba(20, 19, 24, 0.86);
+  --border: rgba(255, 255, 255, 0.09);
+  --text: #e9e9ef;
+  --muted: #8f8f9c;
+  --accent: #7aa2f7;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', system-ui,
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+.app {
+  position: relative;
+  height: 100%;
+}
+
+.stage {
+  position: absolute;
+  inset: 0;
+}
+
+.stage canvas {
+  display: block;
+  touch-action: none;
+}
+
+/* ---- 住所欄 ---- */
+
+.hud__address {
+  display: flex;
+  gap: 6px;
+}
+
+.hud__address input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text);
+  font: inherit;
+  font-size: 11.5px;
+}
+
+.hud__address input:focus {
+  outline: none;
+  border-color: rgba(122, 162, 247, 0.75);
+}
+
+.hud__address button {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.hud__address button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ---- ステータス表示 ---- */
+
+.hud {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  width: 336px;
+  background: var(--panel);
+  backdrop-filter: blur(14px) saturate(140%);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+  font-size: 12.5px;
+  overflow: hidden;
+  user-select: none;
+}
+
+.hud__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.hud__title {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  font-size: 12.5px;
+  flex: 1;
+}
+
+.hud__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.hud__status i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #55555f;
+}
+
+.hud__status--ready i {
+  background: #4ade80;
+  box-shadow: 0 0 8px #4ade80;
+}
+
+.hud__status--booting i {
+  background: #facc15;
+  box-shadow: 0 0 8px #facc15;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.hud__status--error i {
+  background: #f87171;
+}
+
+.hud__status--unavailable i {
+  background: #a1a1aa;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.hud__body {
+  padding: 0 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.hud__section {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.hud__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.hud__label {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.hud__kbd {
+  background: rgba(255, 255, 255, 0.09);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 10px;
+  font-family: ui-monospace, monospace;
+  text-transform: none;
+}
+
+.hud__sources {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.hud__source {
+  padding: 8px 8px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text);
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
+  line-height: 1.35;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.hud__source:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.hud__source.is-active {
+  border-color: rgba(122, 162, 247, 0.75);
+  background: rgba(122, 162, 247, 0.16);
+}
+
+.hud__ghost {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.hud__ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.hud__ghost:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.hud__ghost--wide {
+  width: 100%;
+}
+
+.hud__detail {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+  font-size: 11.5px;
+  min-height: 1em;
+}
+
+.hud__hints {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  color: var(--muted);
+  font-size: 11px;
+  gap: 4px;
+}
+
+.hud__instructions {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 10px;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.hud__instructions p {
+  margin: 0 0 8px;
+  color: var(--muted);
+  line-height: 1.5;
+  font-size: 11px;
+}
+
+.hud__instructions pre {
+  margin: 0 0 8px;
+  padding: 8px;
+  overflow-x: auto;
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: 6px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: #b9c8ea;
+}
+
+.hud__muted {
+  margin: 0 !important;
+  font-style: italic;
+}
+
+/* ---- フッター ---- */
+
+.footer {
+  position: absolute;
+  left: 16px;
+  bottom: 14px;
+  display: flex;
+  gap: 18px;
+  color: #6f6f7c;
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.footer b {
+  color: #a9a9b8;
+  font-weight: 600;
+}
+
+.footer code {
+  font-family: ui-monospace, monospace;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 4px;
+  padding: 1px 4px;
+}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>gecko probe</title></head>
+<body style="margin:0;background:#333">
+<canvas id="screen" width="960" height="720" style="display:block;background:#000"></canvas>
+<div id="status" style="color:#9cf;font:11px/1.5 monospace;padding:4px;white-space:pre-wrap"></div>
+<script type="module">
+const q = new URLSearchParams(location.search)
+const out = document.getElementById('status')
+const log = (t) => { out.textContent = (t + '\n' + out.textContent).slice(0, 4000) }
+
+const manifest = await (await fetch('/engine/manifest.json')).json()
+const mod = await import('/engine/gecko.js')
+const Gecko = mod.Gecko ?? mod.default
+
+const engine = new Gecko({
+  canvas: document.getElementById('screen'),
+  width: 960,
+  height: 720,
+  env: { GECKO_COARSE_CLOCK: '1' },
+  wasm: manifest.wasm,
+  wispUrl: q.get('wisp') ?? 'ws://127.0.0.1:5001/',
+  print: (l) => log('[g] ' + l.slice(0, 140)),
+  printErr: (l) => log('[E] ' + l.slice(0, 140)),
+})
+await engine.init()
+await engine.resize(960, 720)
+log('READY')
+window.__probe = {
+  load: (u) => engine.load(u),
+  eval: (js) => engine.evalChrome(js),
+}
+</script>
+</body>
+</html>
