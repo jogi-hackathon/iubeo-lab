@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>IUBEO — 空の劣化レイヤー v3（WebGPU / WGSL）</title>
+<link rel="icon" href="data:,">
+<style>
+  html,body{margin:0;height:100%;background:#fff;overflow:hidden;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif;color:#111}
+  #c{display:block;width:100vw;height:100vh}
+  #ui{position:fixed;left:14px;top:14px;background:rgba(255,255,255,.9);padding:10px 12px;border-radius:10px;
+      font-size:12px;line-height:1.7;box-shadow:0 3px 14px rgba(0,0,0,.12);border:1px solid rgba(0,0,0,.06)}
+  #ui label{display:block;white-space:nowrap}
+  input[type=range]{width:170px;vertical-align:middle}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  #err{position:fixed;left:14px;bottom:14px;color:#b00;font-size:12px;font-family:ui-monospace,monospace;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <div><b>IUBEO — 空の劣化レイヤー v3（WebGPU）</b></div>
+  <label>視点の高さ / Y（落とされると下がる）: <span class="mono" id="yv">0.00</span>
+    <input id="y" type="range" min="0" max="600" value="0"></label>
+  <label>見上げ角: <span class="mono" id="pv">0.12</span>
+    <input id="p" type="range" min="-40" max="60" value="12"></label>
+  <label>劣化スケール: <span class="mono" id="dv">1.00</span>
+    <input id="d" type="range" min="0" max="200" value="100"></label>
+  <label>量子化ステップ N（バンディング）: <span class="mono" id="nv">28</span>
+    <input id="n" type="range" min="4" max="64" value="28"></label>
+  <label>波の振幅: <span class="mono" id="wv">1.00</span>
+    <input id="w" type="range" min="0" max="250" value="100"></label>
+  <label>ブロック更新 <span class="mono" id="fv">2.0</span> Hz
+    <input id="f" type="range" min="0" max="120" value="20"></label>
+  <div style="opacity:.7">層1: 8px / 層2: 20px / 層3: 44px の順に上から降りてくる</div>
+  <div style="opacity:.7" class="mono" id="adapter">adapter: ...</div>
+</div>
+<div id="err"></div>
+<script id="shader" type="x-wgsl">
+struct P {
+  resX : f32, resY : f32,
+  t : f32,     // 時間(秒)
+  d : f32,     // 劣化スケール
+  n : f32,     // 量子化ステップ（バンディング）
+  w : f32,     // 波の振幅
+  f : f32,     // ブロック更新の量子化周波数(Hz)
+  y : f32,     // 視点のワールド高さ（彼らからの距離の軸）
+  p : f32,     // 見上げ角
+  pad0 : f32, pad1 : f32, pad2 : f32
+};
+@group(0) @binding(0) var<uniform> u : P;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4f {
+  var pos = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(pos[vi], 0.0, 1.0);
+}
+
+const PI : f32 = 3.14159265;
+
+fn h21(p_in : vec2f) -> f32 {
+  var p = fract(p_in * vec2f(123.34, 345.45));
+  p += dot(p, p + 34.345);
+  return fract(p.x * p.y);
+}
+
+// ブロック内の DC ズレ（＝ブロック単位の明度段差）
+fn dcOffset(px : vec2f, size : f32, tq : f32, seed : f32) -> f32 {
+  let cid = floor(px / size);
+  return h21(cid + vec2f(seed, seed) + vec2f(tq * 0.11, tq * 0.07)) - 0.5;
+}
+
+// ブロックごとの疑似DCT：低次の余弦基底に乱数係数をかけ合わせる
+// → ブロック境界で不連続になる＝JPEGのブロック歪み／リンギングの質感
+fn dctBlock(px : vec2f, size : f32, tq : f32, seed : f32) -> f32 {
+  let cid = floor(px / size);
+  let fr  = fract(px / size) * PI;              // 0..PI
+  let r1 = h21(cid + vec2f(seed, seed) + vec2f(tq * 0.37, 1.3)) - 0.5;
+  let r2 = h21(cid + vec2f(seed, seed) + vec2f(1.7, tq * 0.71)) - 0.5;
+  let r3 = h21(cid + vec2f(seed, seed) + vec2f(tq * 0.23, 3.1)) - 0.5;
+  let r4 = h21(cid + vec2f(seed, seed) + vec2f(5.3, tq * 0.53)) - 0.5;
+  let b1 = cos(fr.x) * cos(fr.y);               // 偶数次：ブロック中央が山
+  let b2 = cos(2.0 * fr.x);                     // 水平リンギング
+  let b3 = cos(2.0 * fr.y);                     // 垂直リンギング
+  let b4 = cos(3.0 * fr.x) * cos(2.0 * fr.y);
+  return r1 * b1 + r2 * b2 + r3 * b3 + r4 * b4;
+}
+
+// 高さ（層座標）に応じて 3 段の劣化層を重ねる
+fn artifacts(px : vec2f, tq : f32, layer : f32) -> f32 {
+  // 層ごとに「受け渡し」させる（上位層が来たら下位層は消える）
+  let s3 = smoothstep(4.4, 6.2, layer);                        // 第3層 44px
+  let s2 = smoothstep(2.6, 4.2, layer) * (1.0 - s3);           // 第2層 20px
+  let s1 = smoothstep(0.8, 2.4, layer) * (1.0 - s2 - s3);      // 第1層 8px
+  let tq2 = floor(tq * 0.5);
+  let tq3 = floor(tq * 0.25);
+
+  var v = 0.0;
+  v += s1 * (0.035 * dctBlock(px,  8.0, tq,  3.0) + 0.045 * dcOffset(px,  8.0, tq,  9.0));
+  v += s2 * (0.045 * dctBlock(px, 20.0, tq2, 17.0) + 0.050 * dcOffset(px, 20.0, tq2, 23.0));
+  v += s3 * (0.060 * dctBlock(px, 44.0, tq3, 31.0) + 0.065 * dcOffset(px, 44.0, tq3, 37.0));
+  return v;
+}
+
+@fragment
+fn fs(@builtin(position) pos : vec4f) -> @location(0) vec4f {
+  // GLSL の gl_FragCoord は左下原点なので、WebGPU の左上原点を反転して等価にする
+  let fcv = vec2f(pos.x, u.resY - pos.y);
+  let res = vec2f(u.resX, u.resY);
+
+  var uv = (fcv * 2.0 - res) / res.y;
+  uv += vec2f(0.0, u.p * 1.4);                  // 見上げ角
+  let dir = normalize(vec3f(uv, 1.5));
+
+  let up   = max(dir.y, 0.0);
+  let down = max(-dir.y, 0.0);
+
+  // ---------- 下側：砂漠であり海である波（遠くで振幅が消える）----------
+  let far = 1.0 / max(down, 0.02);
+  let amp = exp(-far * 0.050);
+  let dp  = log(max(far, 1.0));
+  let r1 = sin(uv.x * 3.2 + dp * 2.2 + u.t * 0.30);
+  let r2 = sin(uv.x * 7.7 - dp * 1.3 + u.t * 0.47);
+  let r3 = sin(dp * 6.0 - u.t * 0.25);
+  let wvN = 0.5 + 0.25 * r1 + 0.25 * r2;
+  let groundL = 1.0 - amp * (0.26 + 0.18 * wvN + 0.06 * r3) * u.w;
+
+  // ---------- 上側：上に行くほど灰＝彼ら側（量子化でバンディング）----------
+  let g  = pow(up, 1.15);
+  let q  = floor(g * u.n) / u.n;
+  let gq = mix(g, q, 0.90);
+  let skyL = mix(1.0, 0.90, gq);
+
+  let skyMix = smoothstep(0.0, 0.30, up);
+  var L = mix(groundL, skyL, skyMix);
+
+  // ---------- 高さ軸＝彼らからの距離：上（と視点の高さ）で劣化が強くなる ----------
+  let layer = u.y + up * 3.0;                   // 層座標（落とされると u.y が下がる）
+  let tq = floor(u.t * u.f);                    // 量子化時間＝カクッと更新
+  let a = u.d;
+  if (a > 0.0001) {
+    L += a * artifacts(fcv, tq, layer) * skyMix;
+
+    // 最上位層だけ：グラデーション自体をブロック状に崩す
+    let s3 = smoothstep(3.0, 6.0, layer);
+    if (s3 > 0.0) {
+      let bpx = floor(fcv / 8.0) * 8.0;
+      let buv = (bpx * 2.0 - res) / res.y + vec2f(0.0, u.p * 1.4);
+      let bup = max(normalize(vec3f(buv, 1.5)).y, 0.0);
+      let bg = floor(pow(bup, 1.15) * u.n) / u.n;
+      L = mix(L, mix(1.0, 0.90, bg), s3 * a * skyMix * 0.65);
+    }
+
+    // モスキートノイズ：量子化の段差（等高線）の近くだけ
+    let fr   = fract(g * u.n);
+    let edge = 1.0 - smoothstep(0.0, 0.07, min(fr, 1.0 - fr));
+    let fine = h21(floor(fcv) + vec2f(tq * 3.7, tq * 1.9)) - 0.5;
+    L += a * fine * 0.060 * edge * smoothstep(0.6, 2.4, layer) * (1.0 - smoothstep(3.6, 5.0, layer));
+  }
+
+  L = clamp(L, 0.0, 1.0);
+  return vec4f(vec3f(L), 1.0);                  // 色相ゼロ
+}
+</script>
+<script type="module">
+const params = new URLSearchParams(location.search);
+const errEl = document.getElementById('err');
+const adapterEl = document.getElementById('adapter');
+const num = (k, def) => (params.get(k) !== null ? parseFloat(params.get(k)) : def);
+
+// ---- UI 配線（v2 と同じ操作系）----
+const yEl = document.getElementById('y'), pEl = document.getElementById('p'),
+      dEl = document.getElementById('d'), nEl = document.getElementById('n'),
+      wEl = document.getElementById('w'), fEl = document.getElementById('f');
+const yv = document.getElementById('yv'), pv = document.getElementById('pv'),
+      dv = document.getElementById('dv'), nv = document.getElementById('nv'),
+      wvEl = document.getElementById('wv'), fv = document.getElementById('fv');
+yEl.value = num('y', 0) * 100;
+pEl.value = num('p', 0.12) * 100;
+dEl.value = num('d', 1) * 100;
+nEl.value = num('n', 28);
+wEl.value = num('w', 1) * 100;
+fEl.value = num('f', 2) * 10;
+if (params.get('hud') === '0') document.getElementById('ui').style.display = 'none';
+const fixedT = params.get('t') !== null ? parseFloat(params.get('t')) : null;
+const CAPTURE = params.get('capture') === '1';
+
+function readUI(){
+  yv.textContent = (yEl.value / 100).toFixed(2);
+  pv.textContent = (pEl.value / 100).toFixed(2);
+  dv.textContent = (dEl.value / 100).toFixed(2);
+  nv.textContent = nEl.value;
+  wvEl.textContent = (wEl.value / 100).toFixed(2);
+  fv.textContent = (fEl.value / 10).toFixed(1);
+}
+readUI();
+
+const W = 1280, H = 720;
+
+function uniforms(t, width = W, height = H){
+  const a = new Float32Array(12);
+  a[0] = width; a[1] = height;
+  a[2] = t; a[3] = dEl.value / 100; a[4] = parseFloat(nEl.value);
+  a[5] = wEl.value / 100; a[6] = fEl.value / 10;
+  a[7] = yEl.value / 100; a[8] = pEl.value / 100;
+  return a;
+}
+
+async function main(){
+  if (!navigator.gpu) throw new Error('navigator.gpu が無い（WebGPU非対応ブラウザ）');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('requestAdapter() が null（アダプタ無し）');
+  const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
+  const desc = [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' / ') || '(info非公開)';
+  adapterEl.textContent = 'adapter: ' + desc;
+  const device = await adapter.requestDevice();
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({ device, format, alphaMode: 'opaque' });
+
+  const module = device.createShaderModule({ code: document.getElementById('shader').textContent });
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module, entryPoint: 'vs' },
+    fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' }
+  });
+  const ubo = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const bind = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: ubo } }]
+  });
+
+  function resize(){
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width  = Math.round(innerWidth  * dpr);
+    canvas.height = Math.round(innerHeight * dpr);
+  }
+  resize();
+
+  function encode(target){
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginRenderPass({
+      colorAttachments: [{ view: target, clearValue: { r: 1, g: 1, b: 1, a: 1 }, loadOp: 'clear', storeOp: 'store' }]
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bind);
+    pass.draw(3, 1, 0, 0);
+    pass.end();
+    return enc.finish();
+  }
+
+  function draw(t){
+    device.queue.writeBuffer(ubo, 0, uniforms(t, canvas.width, canvas.height));
+    device.queue.submit([encode(ctx.getCurrentTexture().createView())]);
+  }
+
+  addEventListener('resize', () => {
+    resize();
+    if (fixedT !== null && !CAPTURE) draw(fixedT);
+  });
+
+  // ---- キャプチャ経路：canvas 経由せず texture→buffer で読み戻す ----
+  if (CAPTURE) {
+    const tex = device.createTexture({
+      size: [W, H], format: 'rgba8unorm',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC
+    });
+    const bytesPerRow = W * 4;
+    const buf = device.createBuffer({ size: bytesPerRow * H, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    device.queue.writeBuffer(ubo, 0, uniforms(fixedT !== null ? fixedT : 2.0));
+    device.queue.submit([encode(tex.createView())]);
+    // 描画結果を texture -> buffer にコピー（これを忘れると真っ黒なバッファが返る）
+    const enc2 = device.createCommandEncoder();
+    enc2.copyTextureToBuffer({ texture: tex }, { buffer: buf, bytesPerRow, rowsPerImage: H }, { width: W, height: H });
+    device.queue.submit([enc2.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    await buf.mapAsync(GPUMapMode.READ);
+    const src = new Uint8Array(buf.getMappedRange());
+    const cv = new OffscreenCanvas(W, H);
+    const c2 = cv.getContext('2d');
+    const img = c2.createImageData(W, H);
+    // rgba8unorm は直（BGRA変換なし）なのでそのまま流し込める
+    img.data.set(src.subarray(0, W * H * 4));
+    c2.putImageData(img, 0, 0);
+    const blob = await cv.convertToBlob({ type: 'image/png' });
+    const ab = await blob.arrayBuffer();
+    let bin = '';
+    const u8 = new Uint8Array(ab);
+    for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    window.__png = btoa(bin);
+    buf.unmap();
+    window.__captureFormat = 'rgba8unorm';
+  } else {
+    const loop = () => { draw(fixedT !== null ? fixedT : performance.now() / 1000); requestAnimationFrame(loop); };
+    [yEl,pEl,dEl,nEl,wEl,fEl].forEach(el => el.addEventListener('input', () => { readUI(); draw(performance.now()/1000); }));
+    if (fixedT === null) loop(); else draw(fixedT);
+  }
+  window.__adapterInfo = desc;
+  window.__ready = true;
+}
+
+main().catch(e => { errEl.textContent = 'WebGPU error: ' + (e && e.message || e); window.__error = String(e); window.__ready = true; });
+</script>
+</body>
+</html>
