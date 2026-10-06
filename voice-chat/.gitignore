@@ -1,0 +1,22 @@
+node_modules/
+dist/
+bench/results/
+*.log
+.DS_Store
+
+# local state / build outputs — intentionally not part of this lab copy
+.devenv/
+logs/
+.orch/
+bench/demo/
+bench/harness/demo/
+bench/dev-keys/
+_build/
+deps/
+target/
+zig-out/
+.zig-cache/
+/servers/docker/bin/
+/servers/go_vc/go_vc
+/servers/wt_relay/wt_relay
+/bench/chaos-udp/chaos-udp

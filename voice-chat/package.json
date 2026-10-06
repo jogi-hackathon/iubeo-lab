@@ -1,0 +1,9 @@
+{
+  "name": "vc",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "server:ref": "pnpm -C servers/ref-node start",
+    "bench": "pnpm -C bench/harness bench"
+  }
+}

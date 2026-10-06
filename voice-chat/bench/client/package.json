@@ -1,0 +1,14 @@
+{
+  "name": "@vc/bench-client",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "dependencies": {
+    "@moq/net": "^0.4.1",
+    "@vc/protocol": "workspace:*",
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.186.0"
+  }
+}

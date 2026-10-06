@@ -1,0 +1,7 @@
+{
+  "name": "rooms-100",
+  "rooms": 100,
+  "perRoom": 3,
+  "warmupS": 10,
+  "durationS": 60
+}

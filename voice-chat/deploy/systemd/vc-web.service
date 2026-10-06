@@ -1,0 +1,31 @@
+[Unit]
+Description=vc web client (lobby + 3D world, bundles bench/client on start)
+Documentation=file:///opt/vc/deploy/README.md
+After=network-online.target vc-elixir.service
+Wants=network-online.target
+PartOf=vc-elixir.service
+
+[Service]
+Type=simple
+User=vc
+Group=vc
+WorkingDirectory=/opt/vc
+
+Environment=HOME=/var/lib/vc
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=3000
+# Baked into the served pages as window.__VC_CFG
+Environment=VC_SERVER=wss://@VC_HOST@
+Environment=VC_MEDIA=https://@MEDIA_HOST@:@WT_PORT@
+Environment=VC_TRANSPORT=moq
+# VC_WTHASH intentionally unset: the relay presents a Let's Encrypt
+# certificate, which Chrome only accepts unpinned (a pinned certificate must
+# have a validity period of 14 days or less).
+
+ExecStart=/opt/node/bin/node deploy/serve.ts
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

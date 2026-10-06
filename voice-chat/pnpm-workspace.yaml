@@ -1,0 +1,6 @@
+packages:
+  - shared/*
+  - servers/*
+  - bench/*
+allowBuilds:
+  esbuild: true

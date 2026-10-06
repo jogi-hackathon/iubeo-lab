@@ -1,0 +1,39 @@
+# vc public demo reverse proxy. install.sh substitutes @VC_HOST@, @MEDIA_HOST@
+# and installs this as /etc/caddy/Caddyfile.
+#
+#   vc.<domain>     HTTPS + WSS: lobby/world pages and the vc service API
+#   media.<domain>  plain HTTP only: the ACME webroot certbot uses. The
+#                   WebTransport relay terminates its own TLS on UDP @WT_PORT@
+#                   (Caddy cannot proxy HTTP/3 to an origin).
+@GLOBAL_BLOCK@
+@VC_HOST@ {
+	# certbot's HTTP-01 webroot (Caddy's own ACME challenge is handled before
+	# the site handlers, so this is only needed if certbot also issues here)
+	handle /.well-known/acme-challenge/* {
+		root * /var/www/acme
+		file_server
+	}
+
+	# vc service: /v1/signaling (WebSocket), /v1/join, /v1/rooms,
+	# /v1/moq/auth (relay webhook), /healthz, /metrics
+	@vcapi path /v1/* /healthz /metrics
+	handle @vcapi {
+		reverse_proxy 127.0.0.1:8081
+	}
+
+	# everything else: the lobby, /world and /bench bundles
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
+}
+
+http://@MEDIA_HOST@ {
+	handle /.well-known/acme-challenge/* {
+		root * /var/www/acme
+		file_server
+	}
+
+	handle {
+		respond "vc media relay — WebTransport over QUIC on UDP @WT_PORT@" 200
+	}
+}

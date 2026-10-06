@@ -1,0 +1,18 @@
+{
+  "name": "@vc/harness",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "bench": "node src/cli.ts",
+    "playwright-install": "playwright install chromium",
+    "genkeys": "node src/genkeys.ts"
+  },
+  "dependencies": {
+    "@vc/protocol": "workspace:*",
+    "esbuild": "^0.25.0",
+    "jose": "^6.0.0",
+    "playwright": "^1.49.0",
+    "ws": "^8.18.0"
+  }
+}

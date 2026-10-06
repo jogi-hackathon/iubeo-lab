@@ -1,0 +1,7 @@
+{
+  "name": "smoke",
+  "rooms": 1,
+  "perRoom": 3,
+  "warmupS": 4,
+  "durationS": 15
+}

@@ -1,0 +1,29 @@
+[Unit]
+Description=vc service (WebSocket signaling, JWT, lobby API, moq relay auth)
+Documentation=file:///opt/vc/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vc
+Group=vc
+WorkingDirectory=/opt/vc/servers/elixir_vc
+
+Environment=HOME=/var/lib/vc
+Environment=MIX_HOME=/var/lib/vc/.mix
+Environment=HEX_HOME=/var/lib/vc/.hex
+Environment=MIX_ENV=prod
+Environment=PORT=8081
+# Production Ed25519 keypair (deploy/genkeys.mjs). Without these the service
+# falls back to the committed dev keys, which must never happen on a public host.
+Environment=VC_PUBLIC_KEY_PATH=/etc/vc/keys/public.jwk
+Environment=VC_PRIVATE_KEY_PATH=/etc/vc/keys/private.jwk
+Environment=PATH=/opt/elixir/bin:/opt/otp/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+
+ExecStart=/opt/elixir/bin/elixir -S mix run --no-halt
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

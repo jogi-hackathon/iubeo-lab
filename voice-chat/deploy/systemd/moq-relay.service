@@ -1,0 +1,28 @@
+[Unit]
+Description=moq-relay — WebTransport (moq-lite) media relay for vc
+Documentation=file:///opt/vc/deploy/README.md
+After=network-online.target vc-elixir.service
+Wants=network-online.target vc-elixir.service
+
+[Service]
+Type=simple
+User=vc
+Group=vc
+WorkingDirectory=/var/lib/vc
+
+# QUIC/HTTP-3 listener. The certificate is a publicly-trusted Let's Encrypt
+# cert (certbot -> deploy/renew-hook.sh) so clients validate the chain instead
+# of pinning a hash.
+ExecStart=/usr/local/bin/moq-relay \
+	--listen 0.0.0.0:@WT_PORT@ \
+	--listen-version @MOQ_LISTEN_VERSION@ \
+	--listen-tls-cert /etc/vc/tls/fullchain.pem \
+	--listen-tls-key /etc/vc/tls/privkey.pem \
+	--auth-url http://127.0.0.1:8081/v1/moq/auth \
+	--internal-listen 127.0.0.1:9101
+
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
