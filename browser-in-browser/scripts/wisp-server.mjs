@@ -20,6 +20,12 @@ import http from 'node:http'
 const HOST = process.env.WISP_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.WISP_PORT ?? 5001)
 
+// このプロキシはローカル専用（127.0.0.1 にバインド）なので、エンジンから
+// localhost:5173 のようなローカル dev サーバへの接続を許す。
+// 共有プロキシとして公開する場合は外すこと（SSRF 対策が既定値の理由）。
+wisp.options.allow_private_ips = true
+wisp.options.allow_loopback_ips = true
+
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' })
   res.end('wisp server (browser-in-browser)')

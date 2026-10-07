@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
-import type { ScreenStatus } from '../screen/types'
+import type { ScreenSource, ScreenStatus } from '../screen/types'
+import { canSnapshot } from '../screen/types'
 import type { SourceDescriptor } from '../screen/registry'
+import { WebSearchPanel } from './WebSearchPanel'
 
 /** アドレス欄に渡す束。`navigate` を持たないソースでは null。 */
 export interface HudAddress {
@@ -15,6 +17,8 @@ interface HudProps {
   detail: string
   engaged: boolean
   address: HudAddress | null
+  /** Web Search タスクの対象になるソース（ページを取り出せるものだけパネルを出す）。 */
+  source: ScreenSource | null
   onSelect: (id: string) => void
   onEngage: () => void
   onDisengage: () => void
@@ -36,6 +40,7 @@ export function Hud({
   detail,
   engaged,
   address,
+  source,
   onSelect,
   onEngage,
   onDisengage,
@@ -77,6 +82,12 @@ export function Hud({
             </div>
 
             {address && <AddressBar address={address} powered={powered} />}
+
+            {source && canSnapshot(source) && (
+              <WebSearchPanel powered={powered} source={source} />
+            )}
+
+            {activeId === 'gecko' && <EngineVersionSelect />}
 
             <div className="hud__section">
               <div className="hud__row">
@@ -172,6 +183,70 @@ function shortenUrl(url: string, max = 46): string {
   return `${url.slice(0, max - 1)}…`
 }
 
+interface EngineVersionEntry {
+  version: string
+  dir: string
+}
+
+interface EngineVersionsIndex {
+  default?: string
+  versions?: EngineVersionEntry[]
+}
+
+/**
+ * engine:link が versions.json に並べたバージョンから選ぶ。
+ * 切り替えは ?engine=<dir> を付けてリロード = エンジンごと作り直すので
+ * glue と wasm の食い違いが起きない。versions.json が無い（旧配置）なら描画しない。
+ */
+function EngineVersionSelect() {
+  const [index, setIndex] = useState<EngineVersionsIndex | null>(null)
+  const current =
+    new URLSearchParams(location.search).get('engine') ?? index?.default ?? ''
+
+  useEffect(() => {
+    let alive = true
+    fetch('/engine/versions.json', { cache: 'no-store' })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data: EngineVersionsIndex | null) => {
+        if (alive && data?.versions?.length) setIndex(data)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  if (!index?.versions?.length) return null
+
+  const selectVersion = (dir: string) => {
+    if (!dir || dir === current) return
+    const url = new URL(location.href)
+    url.searchParams.set('engine', dir)
+    location.href = url.toString()
+  }
+
+  return (
+    <div className="hud__section">
+      <div className="hud__row">
+        <span className="hud__label">エンジンのバージョン</span>
+        <select
+          className="hud__select"
+          value={current}
+          onChange={(event) => selectVersion(event.target.value)}
+        >
+          {index.versions.map((entry) => (
+            <option key={entry.dir} value={entry.dir}>
+              v{entry.version}
+              {entry.dir === index.default ? '（既定）' : ''}
+            </option>
+          ))}
+        </select>
+      </div>
+      <p className="hud__muted">変更するとリロードされ、エンジンが作り直されます</p>
+    </div>
+  )
+}
+
 function EngineInstructions() {
   return (
     <div className="hud__instructions">
@@ -181,10 +256,10 @@ function EngineInstructions() {
       </p>
       <pre>
         {`# 1. ビルド済みリリースを取得
-curl -LO https://github.com/thirdlf03/firefox-wasm/releases/download/v0.0.3/gecko.js-v0.0.3.tar.gz
+curl -LO https://github.com/thirdlf03/firefox-wasm/releases/download/v0.0.6/gecko.js-v0.0.6.tar.gz
 
-# 2. このプロジェクトに接続
-npm run engine:link -- --from gecko.js-v0.0.3.tar.gz`}
+# 2. このプロジェクトに接続（複数バージョンを並べて置けます）
+npm run engine:link -- --from gecko.js-v0.0.6.tar.gz`}
       </pre>
       <p className="hud__muted">
         自分でビルドする場合もコマンドは同じです（Linux + emsdk 6.0.1 で make libxul、

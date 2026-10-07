@@ -13,7 +13,9 @@
     "wisp": "node scripts/wisp-server.mjs",
     "verify": "node verify/screen.mjs",
     "verify:engine": "node verify/engine.mjs",
-    "verify:wisp": "node verify/wisp-e2e.mjs"
+    "verify:wisp": "node verify/wisp-e2e.mjs",
+    "verify:websearch": "node verify/websearch.mjs",
+    "verify:webgl": "node verify/webgl.mjs"
   },
   "dependencies": {
     "@react-three/fiber": "^9.8.1",

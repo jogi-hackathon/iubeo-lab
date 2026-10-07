@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="utf-8"><title>nav-a</title></head>
+<body style="background:#123;color:#fff;font:20px sans-serif">
+<h1>NAV-A</h1>
+<a id="same" href="/nav-b.html" style="color:#8f8">same-tab link</a><br>
+<a id="blank" href="/nav-b.html" target="_blank" style="color:#f88">_blank link</a><br>
+<button id="href" onclick="location.href='/nav-b.html'">location.href</button><br>
+<button id="push" onclick="history.pushState({},'pushed','/nav-b.html?pushed=1');document.body.dataset.pushed='1'">pushState</button><br>
+<form id="form" action="/nav-b.html" method="get"><button id="formbtn">form submit</button></form><br>
+<button id="wopen" onclick="window.open('/nav-b.html')">window.open</button><br>
+<a id="redir" href="/nav-redirect" style="color:#ff8">redirect link</a><br>
+<script>
+window.addEventListener('click', e => document.body.dataset.lastclick = e.target.id)
+</script>
+</body></html>

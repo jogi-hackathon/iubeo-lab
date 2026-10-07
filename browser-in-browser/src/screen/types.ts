@@ -67,6 +67,16 @@ export interface ScreenSource {
   /** IME の確定や貼り付け用: キーイベントを介さずに文字列を挿入する。 */
   insertText(text: string): void
 
+  /**
+   * 画面が「ホスト側から毎フレーム読み直すべき生きたサーフェス」か。
+   *
+   * 既定（false）では dirty フラグが立ったときだけ CanvasTexture を再アップロードする。
+   * ところが wasm エンジンの GPU モードは engine 側に blit ループを持たず、#screen の
+   * WebGL サーフェスへ直接合成するため、こちらから isDirty() を立てる機会が無い。
+   * このフラグが true のソースは毎フレーム再アップロードする。
+   */
+  readonly liveSurface?: boolean
+
   /** ソースが持つアニメーションを進める（カーソル点滅、エンジンのフレーム供給）。 */
   tick(): void
   /** 次の描画の前にテクスチャを再アップロードすべきか。 */
@@ -95,6 +105,23 @@ export interface NavigableScreenSource extends ScreenSource {
 
 export function isNavigable(source: ScreenSource): source is NavigableScreenSource {
   return typeof (source as Partial<NavigableScreenSource>).navigate === 'function'
+}
+
+/** 「今開いているページ」の中身をホスト側へ引き出せるソース（Web Search タスク用）。 */
+export interface PageSnapshot {
+  url: string
+  title: string
+  /** 本文の先頭。判定の材料なので長くしすぎない。 */
+  text: string
+}
+
+export interface SnapshotScreenSource extends ScreenSource {
+  /** 現在のドキュメントを取り出す。未起動・取得失敗時は null。 */
+  snapshotPage(): Promise<PageSnapshot | null>
+}
+
+export function canSnapshot(source: ScreenSource): source is SnapshotScreenSource {
+  return typeof (source as Partial<SnapshotScreenSource>).snapshotPage === 'function'
 }
 
 /**

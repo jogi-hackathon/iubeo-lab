@@ -69,7 +69,9 @@ export function createScreenRuntime(source: ScreenSource): ScreenRuntime {
       // ソースを動かし（カーソル点滅、エンジンのフレーム供給）、変化があれば
       // その画素を GPU へ渡す。
       active.tick()
-      if (active.isDirty()) {
+      // liveSurface（wasm エンジンの GPU モード）は向こうから dirty を立ててくれない
+      // ので、毎フレーム読み直す。それ以外は dirty のときだけ。
+      if (active.liveSurface || active.isDirty()) {
         active.texture.needsUpdate = true
         active.clearDirty()
       }

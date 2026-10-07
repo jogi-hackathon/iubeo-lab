@@ -1,10 +1,13 @@
 import { CanvasScreenSource } from './CanvasScreenSource'
+import { WEBSEARCH_HOME, webSearchEnabled } from '../websearch'
 import type { GeckoInstance, GeckoModule, GeckoOptions } from './geckoTypes'
 import type {
   NavigableScreenSource,
+  PageSnapshot,
   ScreenKeyEvent,
   ScreenModifiers,
   ScreenPointerEvent,
+  SnapshotScreenSource,
 } from './types'
 
 /**
@@ -15,13 +18,24 @@ import type {
  * 合成 DOM イベントとして投げ返す。こうすることでエンジンの入力パイプラインを
  * そのまま再利用でき、コマンドプロトコルを二重実装せずに済む。
  *
- * 設計上の制約が 2 つある:
+ * 合成モードが 2 つあり、テクスチャの読み方が変わる:
  *
- *  - **ソフトウェア合成のみ。** gecko.js の GPU モードは OffscreenCanvas を描画スレッドへ
- *    転送してしまうため、ページ側にはサンプリングできるものが残らない。GECKO_GPU を
- *    設定しないことで、エンジンは 2D コンテキストへ BGRA フレームを blit する。
- *  - **cross-origin isolation 必須。** pthread が SharedArrayBuffer を使うため、COOP:
- *    same-origin + COEP: require-corp が必要（vite.config.ts が付与している）。
+ *  - **ソフトウェア合成（既定）。** エンジンは毎フレーム BGRA を 2D コンテキストへ
+ *    blit し、こちらは dirty 通知でそれを読む。コンテンツの WebGL は使えない
+ *    （JS から見える WebGL は out-of-process canvas IPC 経由で、RenderDocument の
+ *    ソフトウェア合成にはコンポジタが居ないため）。
+ *  - **GPU 合成（`?env.GECKO_GPU=1&env.GECKO_GL_PASSTHROUGH=1`）。** WebRender が
+ *    #screen へ直接合成するのでコンテンツの WebGL も動く。ただしエンジン側に
+ *    「フレームを渡す」ループが無いので、こちらから毎フレーム読み直す
+ *    （liveSurface を参照）。
+ *
+ * なお GPU モードでは #screen の制御が Renderer スレッドの OffscreenCanvas へ
+ * 移るが、placeholder の <canvas> は「画像ソース」としては生きているので
+ * drawImage / texImage2D はそのまま合成結果を返す（getContext や toDataURL は
+ * InvalidStateError になる）。
+ *
+ * cross-origin isolation は必須。pthread が SharedArrayBuffer を使うため、COOP:
+ * same-origin + COEP: require-corp が必要（vite.config.ts が付与している）。
  */
 
 /** マニフェストが無いときに探す候補。 */
@@ -36,6 +50,17 @@ const WASM_FALLBACKS: ReadonlyArray<readonly [string, boolean]> = [
  * （`url@20[8192]`）なので、それを超えると静かに `NS_NewURI failed` になる。
  */
 const MAX_URL_BYTES = 8192
+
+/**
+ * 深い混在ティア再帰（WJ↔PBL ピンポン）でホスト課金が尽きて InternalError を投げ、
+ * React の mount が死ぬサイトのブロックリスト。`_wj_set_depth_limit(1)` を投げると
+ * call を含む全 JIT 関数が entry で suspend し、以降の JS→WJ entry は全部 PBL の
+ * ヒープシャドウスタックへ委譲される = そのサイトだけ実行時に PBL 運転できる。
+ * （GECKO_NOWASMJIT=1 と違い、エンジン再起動が要らない。）
+ */
+const PBL_ONLY_HOSTS = new Set(['x.com', 'twitter.com', 'mobile.twitter.com'])
+const WJ_DEPTH_PBL_ONLY = 1
+const WJ_DEPTH_DEFAULT = 480000
 
 /** UTF-8 の HTML を data: URL にする。
  *
@@ -68,35 +93,77 @@ export function pageToDataUrl(html: string): string {
  */
 export const ENGINE_FONTS_ARE_LATIN_ONLY = true
 
+/**
+ * manifest が `*.wasm.zst` を指していても、同じ場所に非圧縮の `*.wasm` があれば
+ * そちらを使う。非圧縮ならブラウザが application/wasm + HTTP キャッシュ付きで
+ * 配信するため instantiateStreaming（ダウンロードと並行してコンパイル）が効き、
+ * zstd 展開（150MB 級で 1 秒前後）も丸ごと省ける。ローカルに wasm を展開して
+ * 置いた場合だけ自動で速くなる、という位置付け。
+ */
+async function preferUncompressed(
+  wasm: NonNullable<EngineManifest['wasm']>,
+): Promise<{ url: string; compressed: boolean }> {
+  const url = wasm.url ?? ''
+  if (!wasm.compressed || !url.endsWith('.zst')) {
+    return { url, compressed: !!wasm.compressed }
+  }
+  const raw = url.slice(0, -'.zst'.length)
+  try {
+    const response = await fetch(raw, { method: 'HEAD' })
+    if (response.ok && (response.headers.get('content-type') ?? '').includes('wasm')) {
+      return { url: raw, compressed: false }
+    }
+  } catch {
+    /* 圧縮版のまま */
+  }
+  return { url, compressed: true }
+}
+
 interface EngineManifest {
   entry?: string
   wasm?: { url?: string; compressed?: boolean }
+  version?: string
   builtAt?: string
 }
 
 interface ResolvedEngine {
   entry: string
   wasm: { url: string; compressed: boolean }
+  version?: string
 }
+
+/** `?engine=` に使えるディレクトリ名（versions.json の dir と対応）。 */
+const ENGINE_DIR_PATTERN = /^[\w.-]+$/
 
 /**
  * `npm run engine:link` が書き出したマニフェストを読む。無ければ既知のパスを総当たりする。
+ * `?engine=v0.0.1` のようにバージョンディレクトリを指定すると、そのマニフェストを読む
+ * （engine:link が public/engine/<dir>/ に並べて置く形式）。無ければ既定の
+ * /engine/manifest.json（= 最後にリンクしたバージョン）へフォールバックする。
  * 見つからなければ null（= エンジン未接続）を返し、例外は投げない。
  */
 async function resolveEngine(): Promise<ResolvedEngine | null> {
-  try {
-    const response = await fetch('/engine/manifest.json', { cache: 'no-store' })
-    if (response.ok) {
+  const requested = new URLSearchParams(location.search).get('engine') ?? ''
+  const manifestUrls = [
+    ENGINE_DIR_PATTERN.test(requested) ? `/engine/${requested}/manifest.json` : '',
+    '/engine/manifest.json',
+  ].filter(Boolean)
+
+  for (const url of manifestUrls) {
+    try {
+      const response = await fetch(url, { cache: 'no-store' })
+      if (!response.ok) continue
       const manifest = (await response.json()) as EngineManifest
       if (manifest.wasm?.url) {
         return {
           entry: manifest.entry ?? ENTRY_FALLBACK,
-          wasm: { url: manifest.wasm.url, compressed: !!manifest.wasm.compressed },
+          wasm: await preferUncompressed(manifest.wasm),
+          version: manifest.version,
         }
       }
+    } catch {
+      /* 次の候補へ */
     }
-  } catch {
-    /* マニフェスト無し: 候補を試す */
   }
 
   for (const [url, compressed] of WASM_FALLBACKS) {
@@ -108,6 +175,26 @@ async function resolveEngine(): Promise<ResolvedEngine | null> {
     }
   }
   return null
+}
+
+/**
+ * 起動前にエンジンの重い資産を裏で温める。gecko.js はバンドル + 埋め込み
+ * gecko.data で 13MB 級あり、import（fetch+パース+評価）をモジュールマップに
+ * 載せておくとクリック時の待ちから消せる。
+ * wasm 本体はここでは取らない: localhost 配信なら 150MB でも sub-second だし、
+ * わざわざ arrayBuffer に抱え込むとメモリを圧迫するだけ。非圧縮 .wasm は
+ * max-age 付きで配信されるので、一度起動すれば以降は HTTP キャッシュが効く。
+ */
+export function prewarmEngine(): void {
+  void (async () => {
+    const resolved = await resolveEngine()
+    if (!resolved) return
+    try {
+      await import(/* @vite-ignore */ resolved.entry)
+    } catch {
+      /* 本起動時に改めて判定する */
+    }
+  })()
 }
 
 /**
@@ -141,11 +228,14 @@ button{margin-left:6px;padding:7px 12px;border-radius:6px;border:1px solid #3a3a
 <div class=c><p style=margin:0>Input forwarding: click below and type on your real keyboard (IME included).</p>
 <input placeholder="click here and type"><button onclick="this.textContent=this.textContent=='pressed'?'again':'pressed'">press me</button></div>
 <div class=c><p style=margin:0>Scrolling, context menus and text selection are the engine's own behaviour. A click turns this page blue, a key turns it red.</p>
-<p style="margin:8px 0 0;color:#8b8b96">There is no JIT, so JS-heavy sites are slow. The point is being fully local: zero network latency, no server. Latin text only &mdash; the minimal GRE ships no CJK font, so Japanese would render as boxes.</p></div>
+<p style="margin:8px 0 0;color:#8b8b96">JS is JIT-compiled to Wasm at runtime (disable with <code>?env.GECKO_NOWASMJIT=1</code>), but heavy sites are still slower than native. The point is being fully local: zero network latency, no server. Latin text only &mdash; the minimal GRE ships no CJK font, so Japanese would render as boxes.</p></div>
 </body></html>`
 }
 
-export class GeckoSource extends CanvasScreenSource implements NavigableScreenSource {
+export class GeckoSource
+  extends CanvasScreenSource
+  implements NavigableScreenSource, SnapshotScreenSource
+{
   readonly id = 'gecko'
   readonly label = 'Gecko (wasm エンジン)'
   readonly note = 'Firefox のエンジンそのものを WebAssembly 化。完全にローカルで動作しサーバ不要'
@@ -155,6 +245,25 @@ export class GeckoSource extends CanvasScreenSource implements NavigableScreenSo
   private url = ''
   private readonly wispUrl?: string
   private progressTimer?: number
+  /** エンジンが GPU モードで走っているか（#screen に直接合成しているか）。 */
+  private gpuMode = false
+  /** PBL_ONLY_HOSTS 内のページを見ている間 true。wjPinTimer が depth limit を 1 にピン留めする。 */
+  private pblOnly = false
+  /** wjProbeStack が実測キャリブレーションで書き込んだ既定値（記憶して復帰に使う）。 */
+  private wjDepthDefault = WJ_DEPTH_DEFAULT
+  private origSetDepthLimit?: (v: number) => void
+  private wjPinTimer?: number
+  private locPollTimer?: number
+  private trackedUrl = ''
+
+  /**
+   * GPU モードのエンジンはフレームをこちらへ通知せず #screen へ直接合成するので、
+   * dirty を待たず毎フレーム CanvasTexture を読み直す。ソフトウェアモードでは
+   * エンジンが blit のたびに dirty を立ててくれるので、そちらは従来どおり。
+   */
+  get liveSurface(): boolean {
+    return this.gpuMode
+  }
 
   constructor(host: HTMLElement, width: number, height: number) {
     super(host, width, height, 'screen')
@@ -166,6 +275,11 @@ export class GeckoSource extends CanvasScreenSource implements NavigableScreenSo
 
   get currentUrl(): string {
     return this.url
+  }
+
+  /** WISP が設定されているか（実サイトに出られるか）。HUD の案内文に使う。 */
+  get hasWisp(): boolean {
+    return !!this.wispUrl
   }
 
   override async boot(): Promise<void> {
@@ -197,9 +311,16 @@ export class GeckoSource extends CanvasScreenSource implements NavigableScreenSo
       return
     }
 
+    // エンジンはソフトウェア合成の各フレームを putImageData で書き込むだけで、
+    // こちらへ dirty 通知を出さない。入力イベント経由でしか dirty が立たないため、
+    // 動画やアニメーションの更新がテクスチャに載らない。canvas はこちらの所有物
+    // なので、getContext が返す 2D コンテキストの putImageData を包んで、
+    // 書き込みのたびに dirty を立てる。エンジンの内部実装には触れない。
+    this.patchBlitNotify()
+
     const env: Record<string, string> = {
-      // GECKO_GPU は意図的に設定しない（上記の制約を参照）。GPU モードにすると
-      // サーフェスが描画スレッドへ渡り、ここでサンプリングできるものが無くなる。
+      // GPU モードは既定では入れない。使うときは
+      // `?env.GECKO_GPU=1&env.GECKO_GL_PASSTHROUGH=1`（後者がコンテンツ WebGL の有効化）。
       GECKO_COARSE_CLOCK: '1',
     }
     // `?env.FOO=bar` でエンジンの環境変数を任意に渡せる（デバッグ用）。
@@ -210,14 +331,22 @@ export class GeckoSource extends CanvasScreenSource implements NavigableScreenSo
     const hostEnv = (window as unknown as { GECKO_ENV?: Record<string, string> }).GECKO_ENV
     if (hostEnv) Object.assign(env, hostEnv)
 
-    const sizeMb = resolved.wasm.compressed ? '32MB' : '233MB'
+    // GPU モードならテクスチャの読み方を変える（liveSurface を参照）。
+    this.gpuMode = !!env.GECKO_GPU
+
+    const sizeMb = resolved.wasm.compressed ? '32MB' : '150MB'
     const startedAt = performance.now()
     // 初回は wasm の取得・展開・インスタンス化で数十秒かかるので、経過時間を出す。
     this.progressTimer = window.setInterval(() => {
       const seconds = Math.round((performance.now() - startedAt) / 1000)
-      this.setDetail(`エンジンを起動中… ${seconds} 秒（${sizeMb} の wasm を展開しています）`)
+      this.setDetail(`エンジンを起動中… ${seconds} 秒（${sizeMb} の wasm を読み込んでいます）`)
     }, 1000)
-    this.setStatus('booting', `エンジンを起動中… 0 秒（${sizeMb} の wasm を展開しています）`)
+    this.setStatus('booting', `エンジンを起動中… 0 秒（${sizeMb} の wasm を読み込んでいます）`)
+
+    // WISP プロキシの疎通確認を wasm 起動と並行して走らせる。プロキシが
+    // 死んでいる/応答しないと最初のページ読み込みが永久に待ち状態になり、
+    // 画面が真っ黒のまま見えるため、事前に切り分ける。
+    const wispCheck = this.checkWisp()
 
     try {
       const options: GeckoOptions = {
@@ -244,17 +373,61 @@ export class GeckoSource extends CanvasScreenSource implements NavigableScreenSo
       this.engine = engine
 
       await engine.init()
+      this.wrapDepthLimit(engine)
       await engine.resize(this.width, this.height)
 
-      this.setDetail('エンジン準備完了。最初のページを読み込んでいます…')
-      await this.load(pageToDataUrl(welcomePage(!!this.wispUrl)))
+      // wasm の展開・起動フェーズはここで終わり。タイマーを止めて以降の
+      // 「ページ読み込み中」の表示が上書きされないようにする。
+      if (this.progressTimer !== undefined) {
+        window.clearInterval(this.progressTimer)
+        this.progressTimer = undefined
+      }
+
+      // Web Search モード（かつ実サイトに出られる WISP 設定あり）なら Google の
+      // 検索画面を最初のページにする。オフラインやモード OFF では従来どおり
+      // ネットワーク不要のウェルカムページ。WISP への疎通が取れない場合も
+      // ウェルカムページにフォールバックし、警告を出す（真っ黒で固まらない）。
+      let wispOk = false
+      let firstPage = pageToDataUrl(welcomePage(!!this.wispUrl))
+      if (this.wispUrl) {
+        wispOk = await wispCheck
+        if (wispOk && webSearchEnabled()) firstPage = WEBSEARCH_HOME
+      }
+
+      const versionTag = resolved.version ? ` v${resolved.version}` : ''
+      const network = this.wispUrl
+        ? wispOk
+          ? `WISP 経由 ${this.wispUrl}`
+          : `⚠ WISP プロキシ ${this.wispUrl} に接続できません（組み込みページのみ動作）`
+        : 'オフライン'
+      const readyDetail = `Gecko エンジン${versionTag} · ${network}`
+
+      // data: の組み込みページは一瞬で読み込めるので待ってから ready にする。
+      // http(s)（WISP 経由の実サイト）は INTERACTIVE までエンジン内部で待つため
+      // 重いページだと数十秒かかる。ready を遅らせるとずっと「起動中」に見えるので、
+      // 読み込みはバックグラウンドに回し、逐次描画に任せる。
+      let firstPageLoad: Promise<void> | null = null
+      if (firstPage.startsWith('data:')) {
+        await this.load(firstPage)
+      } else {
+        firstPageLoad = this.load(firstPage)
+      }
 
       this.ready = true
+      this.startLocationTracking()
       this.markDirty()
-      this.setStatus(
-        'ready',
-        this.wispUrl ? 'Gecko エンジン · WISP プロキシ経由' : 'Gecko エンジン · オフライン',
-      )    } catch (error) {
+      if (firstPageLoad) {
+        // 最初のページの読み込みが終わるまでは進行状況をステータスに残す。
+        this.setStatus('ready', `${readyDetail} · 最初のページを読み込んでいます…`)
+        void firstPageLoad
+          .catch((error) => {
+            console.warn('[gecko] 最初のページの読み込みに失敗しました', error)
+          })
+          .finally(() => this.setDetail(readyDetail))
+      } else {
+        this.setStatus('ready', readyDetail)
+      }
+    } catch (error) {
       this.setStatus('error', `エンジンの起動に失敗しました: ${describe(error)}`)
     } finally {
       if (this.progressTimer !== undefined) {
@@ -262,6 +435,43 @@ export class GeckoSource extends CanvasScreenSource implements NavigableScreenSo
         this.progressTimer = undefined
       }
     }
+  }
+
+  /**
+   * WISP プロキシへの WebSocket 疎通確認。握手（onopen）までを見る。
+   * 応答しない・拒否される場合は 8 秒で諦めて false。wisp プロトコル
+   * 自体の検証はしない（接続を開くだけですぐ閉じる）。
+   */
+  private checkWisp(): Promise<boolean> {
+    const url = this.wispUrl
+    if (!url) return Promise.resolve(false)
+    return new Promise<boolean>((resolve) => {
+      let settled = false
+      const finish = (ok: boolean, ws?: WebSocket) => {
+        if (settled) return
+        settled = true
+        window.clearTimeout(timer)
+        if (ws) {
+          ws.onopen = ws.onerror = ws.onclose = null
+          try {
+            ws.close()
+          } catch {
+            /* ignore */
+          }
+        }
+        resolve(ok)
+      }
+      let ws: WebSocket
+      try {
+        ws = new WebSocket(url.endsWith('/') ? url : `${url}/`)
+      } catch {
+        resolve(false)
+        return
+      }
+      const timer = window.setTimeout(() => finish(false, ws), 8000)
+      ws.onopen = () => finish(true, ws)
+      ws.onerror = () => finish(false, ws)
+    })
   }
 
   /**
@@ -280,6 +490,7 @@ export class GeckoSource extends CanvasScreenSource implements NavigableScreenSo
   navigate(input: string): void {
     const target = normalizeUrl(input)
     if (!target || !this.ready || !this.engine) return
+    this.applyDepthLimitFor(target)
     this.url = target
     this.setDetail(`読み込み中: ${target}`)
     void this.engine
@@ -290,6 +501,159 @@ export class GeckoSource extends CanvasScreenSource implements NavigableScreenSo
       .catch((error) => {
         this.setDetail(`読み込みに失敗しました: ${describe(error)}`)
       })
+  }
+
+  /**
+   * ソフトウェアモードでエンジンの blit（putImageData）を dirty 通知に繋ぐ。
+   * GPU モードでは 2D コンテキストを取らないので実質無効（liveSurface が担う）。
+   */
+  private patchBlitNotify(): void {
+    const canvas = this.canvas as HTMLCanvasElement & { __bibBlitPatched?: boolean }
+    if (canvas.__bibBlitPatched) return
+    canvas.__bibBlitPatched = true
+    const origGetContext = canvas.getContext.bind(canvas)
+    const onBlit = () => this.markDirty()
+    canvas.getContext = ((contextId: string, options?: unknown) => {
+      const ctx = origGetContext(
+        contextId as '2d',
+        options as CanvasRenderingContext2DSettings | undefined,
+      )
+      if (
+        contextId === '2d' &&
+        ctx &&
+        !(ctx as { __bibPutPatched?: boolean }).__bibPutPatched
+      ) {
+        const c2d = ctx as CanvasRenderingContext2D & { __bibPutPatched?: boolean }
+        const origPut = c2d.putImageData.bind(c2d)
+        c2d.putImageData = ((...args: Parameters<CanvasRenderingContext2D['putImageData']>) => {
+          origPut(...args)
+          onBlit()
+        }) as typeof c2d.putImageData
+        c2d.__bibPutPatched = true
+      }
+      return ctx
+    }) as typeof canvas.getContext
+  }
+
+  /**
+   * ブロックリストに載る origin への遷移前に WJ の深さ制限を 1 に潰して実質 PBL
+   * 運転に切り替える。一度立った suspend watermark は jitDepth が 0 に戻ると解除
+   * されるが、limit=1 のままなので PBL のまま動き続ける。`data:`/`about:` や
+   * リスト外のサイトでは既定値へ戻す。
+   *
+   * glue の wjProbeStack は pthread worker 側の Module._wj_set_depth_limit を直接
+   * 呼ぶため mod に掛けたラッパーを素通りし、最初の wasmhost_instantiate（= サイト
+   * ロード中）にキャリブ値で上書きしてしまう。そこで pblOnly 中は interval で
+   * 値をピン留めする（1 呼び出しは数 µs で、probe の単発書き込みを確実に潰せる）。
+   */
+  private applyDepthLimitFor(url: string): void {
+    let host = ''
+    try {
+      host = new URL(url).hostname.replace(/^www\./, '')
+    } catch {
+      /* data: 等は PBL 化しない */
+    }
+    this.pblOnly = PBL_ONLY_HOSTS.has(host)
+    if (this.wjPinTimer !== undefined) {
+      window.clearInterval(this.wjPinTimer)
+      this.wjPinTimer = undefined
+    }
+    if (this.pblOnly) {
+      this.wjPinTimer = window.setInterval(() => {
+        try {
+          this.origSetDepthLimit?.(WJ_DEPTH_PBL_ONLY)
+        } catch {
+          /* エンジン停止後は握り潰す */
+        }
+      }, 250)
+    }
+    try {
+      this.origSetDepthLimit?.(this.pblOnly ? WJ_DEPTH_PBL_ONLY : this.wjDepthDefault)
+    } catch (e) {
+      console.warn('[gecko] _wj_set_depth_limit 失敗', e)
+    }
+  }
+
+  /**
+   * アプリ側 navigate() を通らない遷移（ページ内クリック・リダイレクト・history
+   * 操作）でもホスト判定を追従させるため、content の location.href を軽く
+   * ポーリングする。about:/data: はスキップして直前の方針を維持する
+   * （遷移の過渡状態で pin がちらつくのを防ぐ）。
+   */
+  private startLocationTracking(): void {
+    this.locPollTimer = window.setInterval(() => {
+      void this.trackLocation()
+    }, 1000)
+  }
+
+  private async trackLocation(): Promise<void> {
+    const eng = this.engine as unknown as {
+      run?: (a: { op: number; url: string }) => Promise<string>
+    } | null
+    if (!eng?.run || this.disposed) return
+    try {
+      const href = await eng.run({ op: 5, url: 'location.href' })
+      if (
+        typeof href === 'string' &&
+        /^https?:/.test(href) &&
+        href !== this.trackedUrl
+      ) {
+        this.trackedUrl = href
+        this.applyDepthLimitFor(href)
+        this.url = href
+      }
+    } catch {
+      /* content がビジーなら次の tick で */
+    }
+  }
+
+  /**
+   * 今開いているページの url / title / 本文先頭を引き出す（Web Search タスクの
+   * 「このページを提出」で使う）。location 追跡と同じく content global の
+   * eval（op=5）経由。本文は判定材料として先頭 1600 文字に切る。
+   */
+  async snapshotPage(): Promise<PageSnapshot | null> {
+    const eng = this.engine as unknown as {
+      run?: (a: { op: number; url: string }) => Promise<string>
+    } | null
+    if (!eng?.run || !this.ready) return null
+    try {
+      const raw = await eng.run({
+        op: 5,
+        url: `JSON.stringify((() => { try {
+          return {
+            url: location.href,
+            title: document.title || '',
+            text: (document.body ? document.body.innerText : '').slice(0, 1600),
+          }
+        } catch (e) {
+          return { url: location.href, title: '', text: '' }
+        } })())`,
+      })
+      if (typeof raw !== 'string' || !raw.startsWith('{')) return null
+      const parsed = JSON.parse(raw) as PageSnapshot
+      return typeof parsed.url === 'string' ? parsed : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * `mod._wj_set_depth_limit` をラップしてキャリブ値を wjDepthDefault に記憶する。
+   * （実際の probe 呼び出しは worker 側の Module 経由なのでここには来ないが、
+   * main thread 経由の将来の呼び出しに備えて残す。PBL 化の本体は applyDepthLimitFor
+   * のピン留め。）
+   */
+  private wrapDepthLimit(engine: GeckoInstance): void {
+    const mod = (engine as unknown as { mod?: Record<string, unknown> }).mod
+    const orig = mod?._wj_set_depth_limit
+    if (!mod || typeof orig !== 'function') return
+    this.origSetDepthLimit = (orig as (v: number) => void).bind(mod)
+    const self = this
+    mod._wj_set_depth_limit = function (v: number) {
+      if (v > WJ_DEPTH_PBL_ONLY) self.wjDepthDefault = v
+      self.origSetDepthLimit?.(self.pblOnly ? WJ_DEPTH_PBL_ONLY : v)
+    }
   }
 
   /** 内部からの読み込み（起動時のウェルカムページ）。 */
@@ -304,6 +668,14 @@ export class GeckoSource extends CanvasScreenSource implements NavigableScreenSo
     if (this.progressTimer !== undefined) {
       window.clearInterval(this.progressTimer)
       this.progressTimer = undefined
+    }
+    if (this.wjPinTimer !== undefined) {
+      window.clearInterval(this.wjPinTimer)
+      this.wjPinTimer = undefined
+    }
+    if (this.locPollTimer !== undefined) {
+      window.clearInterval(this.locPollTimer)
+      this.locPollTimer = undefined
     }
     this.engine?.destroy()
     this.engine = null
@@ -399,6 +771,11 @@ function describe(error: unknown): string {
 /** HUD が「エンジンは接続済みか」を起動せずに判定するための軽い問い合わせ。 */
 export async function probeEngine(): Promise<boolean> {
   try {
+    const requested = new URLSearchParams(location.search).get('engine') ?? ''
+    if (ENGINE_DIR_PATTERN.test(requested)) {
+      const response = await fetch(`/engine/${requested}/manifest.json`, { method: 'HEAD' })
+      if (response.ok) return true
+    }
     const response = await fetch('/engine/manifest.json', { method: 'HEAD' })
     return response.ok
   } catch {

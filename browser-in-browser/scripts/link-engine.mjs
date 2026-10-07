@@ -16,15 +16,19 @@
  * gecko.js のバンドルは完全に自己完結している（bare import なし・gecko.data を内包）
  * ため、public/ に置いて URL から動的 import するだけでよい。ビルドには一切影響しない。
  *
- *   <from>/gecko.js          -> public/engine/gecko.js       （13.7MB・内包データ込み）
- *   <from>/gecko.wasm[.zst]  -> public/engine/               （34MB・zstd 圧縮）
+ *   <from>/gecko.js          -> public/engine/<dir>/gecko.js       （内包データ込み）
+ *   <from>/gecko.wasm[.zst]  -> public/engine/<dir>/               （zstd 圧縮）
  *   <from>/../package.json   -> manifest.json の version に記録（由来の追跡用）
- *   public/engine/manifest.json をここで書き出す
+ *
+ * <dir> は既定で v<version>（--name で上書き）。バージョンごとに並べて置き、
+ * public/engine/versions.json に一覧を、ルート manifest.json に既定のものを書く。
+ * HUD の「エンジンのバージョン」選択肢か ?engine=<dir> で切り替わる。
  *
  * 使い方:
  *   npm run engine:link -- --from ../firefox-wasm/gecko.js/dist
  *   npm run engine:link -- --from ../firefox-wasm      # gecko.js/dist を自動解決
  *   npm run engine:link -- --from ~/Downloads/gecko.js-v0.0.3.tar.gz   # 展開もする
+ *   npm run engine:link -- --from gecko.js-v0.0.1.tar.gz --name v0.0.1 --no-default
  */
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
@@ -36,7 +40,10 @@ import { fileURLToPath } from 'node:url'
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const PUBLIC_ENGINE = join(projectRoot, 'public', 'engine')
 
-const USAGE = `使い方: npm run engine:link -- --from <gecko.js/dist | firefox-wasm リポジトリ | *.tar.gz>`
+const USAGE = `使い方: npm run engine:link -- --from <gecko.js/dist | firefox-wasm リポジトリ | *.tar.gz> [--name <dir>] [--no-default]
+  複数バージョンは public/engine/v<version>/ に並べて入り、
+  public/engine/versions.json に一覧を書きます。HUD のバージョン選択か
+  ?engine=<version> で切り替えられます。`
 
 function fail(message) {
   console.error(`\n  ✗ ${message}\n`)
@@ -46,11 +53,18 @@ function fail(message) {
 
 function parseArgs(argv) {
   let from = null
+  let name = null
+  let makeDefault = true
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     if (arg === '--from' || arg === '-f') {
       from = argv[index + 1] ?? null
       index += 1
+    } else if (arg === '--name') {
+      name = argv[index + 1] ?? null
+      index += 1
+    } else if (arg === '--no-default') {
+      makeDefault = false
     } else if (arg === '--help' || arg === '-h') {
       console.log(USAGE)
       process.exit(0)
@@ -58,7 +72,7 @@ function parseArgs(argv) {
       from = arg
     }
   }
-  return from
+  return { from, name, makeDefault }
 }
 
 /** .tar.gz なら一時ディレクトリへ展開し、展開先を返す。 */
@@ -93,7 +107,7 @@ function findWasm(dist) {
   return null
 }
 
-const from = parseArgs(process.argv.slice(2))
+const { from, name: nameArg, makeDefault } = parseArgs(process.argv.slice(2))
 if (!from) fail('--from がありません: どこからビルド成果物を取るのか分かりません')
 
 const fromPath = isAbsolute(from) ? from : resolve(process.cwd(), from)
@@ -134,18 +148,26 @@ if (existsSync(pkgPath)) {
 // 「リンクしたエンジンが期待したリリースか」を後から確認するための由来情報。
 const wasmFileSha256 = createHash('sha256').update(readFileSync(wasm.path)).digest('hex')
 
+// 複数バージョンを同居させるため、バージョン名のディレクトリに置く。
+// 上流リリースの package.json は版名が上流側のものなので、tarball の
+// ファイル名（gecko.js-v0.0.1.tar.gz）から取った版名を --name で上書きできる。
+const dirName = nameArg ?? `v${version}`
+if (!/^[\w.-]+$/.test(dirName)) fail(`--name が不正です: ${dirName}`)
+const targetDir = join(PUBLIC_ENGINE, dirName)
+mkdirSync(targetDir, { recursive: true })
+
 // バンドルは自己完結しているので public/ に置くだけで動く。
 // Vite に通さないため、ビルド時間にも成果物サイズにも影響しない。
-copyFileSync(join(dist, 'gecko.js'), join(PUBLIC_ENGINE, 'gecko.js'))
-copyFileSync(wasm.path, join(PUBLIC_ENGINE, wasm.name))
+copyFileSync(join(dist, 'gecko.js'), join(targetDir, 'gecko.js'))
+copyFileSync(wasm.path, join(targetDir, wasm.name))
 
 // 型定義は参照用に持っておくと、上流の API が変わったときに差分が分かる。
 const types = join(dist, 'index.d.ts')
-if (existsSync(types)) copyFileSync(types, join(PUBLIC_ENGINE, 'index.d.ts'))
+if (existsSync(types)) copyFileSync(types, join(targetDir, 'index.d.ts'))
 
 const manifest = {
-  entry: '/engine/gecko.js',
-  wasm: { url: `/engine/${wasm.name}`, compressed: wasm.compressed },
+  entry: `/engine/${dirName}/gecko.js`,
+  wasm: { url: `/engine/${dirName}/${wasm.name}`, compressed: wasm.compressed },
   // 由来の追跡: どのバージョンの・どの成果物かを後から確認できるようにする。
   // version は dist の隣の package.json（= gecko.js パッケージ）から取る。
   version,
@@ -153,18 +175,45 @@ const manifest = {
   builtAt: statSync(wasm.path).mtime.toISOString(),
   linkedFrom: dist,
 }
-writeFileSync(join(PUBLIC_ENGINE, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+writeFileSync(join(targetDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+
+// バージョン一覧を更新する。HUD の選択肢と既定解決の両方がこれを読む。
+// 旧フラット配置（/engine/gecko.js 直下）は versions.json に出さないが、
+// ルート manifest.json 経由で従来どおり解決される。
+const versionsPath = join(PUBLIC_ENGINE, 'versions.json')
+let index = { default: null, versions: [] }
+if (existsSync(versionsPath)) {
+  try {
+    index = JSON.parse(readFileSync(versionsPath, 'utf8'))
+    if (!Array.isArray(index.versions)) index.versions = []
+  } catch {
+    index = { default: null, versions: [] }
+  }
+}
+index.versions = index.versions.filter((v) => v.dir !== dirName)
+index.versions.push({ version, dir: dirName })
+if (makeDefault || !index.default) index.default = dirName
+writeFileSync(versionsPath, `${JSON.stringify(index, null, 2)}\n`)
+
+// ルート manifest.json は「既定バージョン」を指す（後方互換 + ?engine 無しの解決先）。
+const defaultEntry = index.versions.find((v) => v.dir === index.default)
+if (defaultEntry) {
+  const defaultManifestPath = join(PUBLIC_ENGINE, index.default, 'manifest.json')
+  if (existsSync(defaultManifestPath)) {
+    copyFileSync(defaultManifestPath, join(PUBLIC_ENGINE, 'manifest.json'))
+  }
+}
 
 const mb = (path) => (statSync(path).size / 1024 / 1024).toFixed(1)
+const all = index.versions.map((v) => `${v.version}${v.dir === index.default ? ' (default)' : ''}`).join(', ')
 
 console.log(`
-  ✓ wasm エンジンを接続しました  (gecko.js ${version})
-      public/engine/gecko.js   ${mb(join(PUBLIC_ENGINE, 'gecko.js'))} MB（glue + gecko.data を内包）
-      public/engine/${wasm.name}  ${mb(join(PUBLIC_ENGINE, wasm.name))} MB${wasm.compressed ? '（zstd 圧縮）' : ''}
-      public/engine/manifest.json   (wasm file sha256 ${wasmFileSha256.slice(0, 16)}…)
+  ✓ wasm エンジンを接続しました  (gecko.js ${version} -> /engine/${dirName})
+      public/engine/${dirName}/gecko.js   ${mb(join(targetDir, 'gecko.js'))} MB（glue + gecko.data を内包）
+      public/engine/${dirName}/${wasm.name}  ${mb(join(targetDir, wasm.name))} MB${wasm.compressed ? '（zstd 圧縮）' : ''}
+      versions: ${all}
 
   次: npm run dev して HUD の「Gecko (wasm エンジン)」に切り替えてください。
-  初回は ${mb(join(PUBLIC_ENGINE, wasm.name))} MB の wasm を取得・展開・インスタンス化するため
-  数十秒かかります。ページは cross-origin isolated（COOP/COEP）である必要がありますが、
-  vite.config.ts が既にヘッダを付けています。
+  初回は ${mb(join(targetDir, wasm.name))} MB の wasm を取得・展開・インスタンス化するため
+  数十秒かかります。バージョンの切り替えは HUD の選択肢か ?engine=${dirName} です。
 `)

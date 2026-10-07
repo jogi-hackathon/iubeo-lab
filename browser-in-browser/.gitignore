@@ -4,8 +4,10 @@ dist
 *.local
 
 # エンジン成果物（npm run engine:link が配置する）。wasm は約 233MB なので絶対にコミットしない。
-public/engine/*.wasm
-public/engine/*.wasm.zst
+public/engine/**/*.wasm
+public/engine/**/*.wasm.zst
 public/engine/manifest.json
-public/engine/index.d.ts
+public/engine/versions.json
+public/engine/*/manifest.json
+public/engine/*/index.d.ts
 verify/shots/

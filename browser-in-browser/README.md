@@ -21,8 +21,8 @@ npm install
 
 # 2. wasm エンジンを取得（fork のビルド済みリリースを使う。
 #    詳しくは下の「wasm エンジン」を参照。内蔵ブラウザだけ試すならスキップ可）
-curl -LO https://github.com/thirdlf03/firefox-wasm/releases/download/v0.0.3/gecko.js-v0.0.3.tar.gz
-npm run engine:link -- --from gecko.js-v0.0.3.tar.gz
+curl -LO https://github.com/thirdlf03/firefox-wasm/releases/download/v0.0.6/gecko.js-v0.0.6.tar.gz
+npm run engine:link -- --from gecko.js-v0.0.6.tar.gz
 
 # 3. 起動
 npm run dev
@@ -128,17 +128,21 @@ DOM リスナーを付けています。理由は 3 つ: メッシュの外に�
 
 ```bash
 # 1. フォークのビルド済みリリース（35MB）を取得
-curl -LO https://github.com/thirdlf03/firefox-wasm/releases/download/v0.0.3/gecko.js-v0.0.3.tar.gz
+curl -LO https://github.com/thirdlf03/firefox-wasm/releases/download/v0.0.6/gecko.js-v0.0.6.tar.gz
 
 # 2. 接続（tarball でも dist ディレクトリでもリポジトリでも可）
-npm run engine:link -- --from gecko.js-v0.0.3.tar.gz
+npm run engine:link -- --from gecko.js-v0.0.6.tar.gz
 
 # 3. 起動して HUD を「Gecko (wasm エンジン)」へ
 npm run dev
 ```
 
-`engine:link` は 3 つを配置し、`public/engine/manifest.json` を書き出します。ランタイムは
-そのマニフェストを読んでから動的 import するので、**エンジンが無くてもアプリは普通に動きます**
+`engine:link` はバージョンごとのディレクトリ（`public/engine/v<version>/`）に配置し、
+一覧を `public/engine/versions.json`、既定の指す先を `public/engine/manifest.json` に
+書き出します。複数バージョンを繰り返しリンクすると並んで置かれ、HUD の
+「エンジンのバージョン」選択肢か `?engine=<dir>` で切り替えられます
+（既定を変えずに追加するだけなら `--no-default`）。ランタイムはマニフェストを読んでから
+動的 import するので、**エンジンが無くてもアプリは普通に動きます**
 （その場合は HUD が接続手順を表示します）。
 
 バンドルは完全に自己完結している（bare import なし・`gecko.data` を内包）ため、
@@ -147,10 +151,23 @@ npm run dev
 
 ### エンジンを動かす上での実測済みの制約
 
-- **ソフトウェア合成のみ。** GPU モード（`GECKO_GPU`）にするとサーフェスが
-  OffscreenCanvas として描画スレッドへ transfer され、ページ側にはサンプリングできるものが
-  残りません。`GECKO_GPU` を設定しないことで、エンジンは 2D コンテキストへ BGRA フレームを
-  blit し、こちらはそれを `CanvasTexture` として読めます。
+- **合成モードが 2 つある。** 既定はソフトウェア合成で、エンジンが毎フレーム BGRA を 2D
+  コンテキストへ blit し、こちらは dirty 通知でそれを読みます。`?env.GECKO_GPU=1` を渡すと
+  GPU 合成（WebRender → `#screen`）に切り替わります。
+  - コンテンツの WebGL は **GPU 合成でしか動きません**。JS から見える WebGL は
+    out-of-process canvas IPC（`CanvasManagerChild`）を通るため、コンポジタの居ない
+    ソフトウェア合成では `!CanvasManagerChild::Get()` で失敗します（実測）。
+    併せて `?env.GECKO_GL_PASSTHROUGH=1` が必要です（コンテンツ用 GL コンテキストは
+    これを見て作られます）。
+  - GPU 合成ではエンジンがフレーム通知を出さないので、アプリ側が毎フレーム
+    `CanvasTexture` を読み直します（`ScreenSource.liveSurface`）。これが無いと
+    画面は黒いままです（実測。dirty を立てるのは blit するソフトウェアモードだけ）。
+  - GPU 合成では `#screen` の制御が Renderer スレッドの `OffscreenCanvas` へ移りますが、
+    placeholder の `<canvas>` は「画像ソース」としては生きているので `texImage2D` は
+    そのまま合成結果を返します（`getContext` / `toDataURL` は `InvalidStateError`。
+    `verify/webgl.mjs` がこれを実際の画素で確認します）。
+  - 欠点: GPU 合成ではポップアップ（メニュー・`<select>`）が別の 2D canvas に描かれるため、
+    3D 側の画面には出ません（ソフトウェア合成では本体バッファに混ざる）。
 - **cross-origin isolation 必須。** pthread が `SharedArrayBuffer` を使うため、COOP
   `same-origin` + COEP `require-corp` が必要です（`vite.config.ts` が付与しています）。
 - **URL は 8192 バイトまで。** エンジンのコマンド構造体が `url@20[8192]` 固定なので、
@@ -165,6 +182,10 @@ npm run dev
   **日本語の UI は HUD（DOM 側）が担当しています。**
 - **JSPI が必要。** Chrome 137+ / Firefox 153+ で既定有効。古いブラウザでは
   「This browser doesn't support WebAssembly JSPI」と出ます。
+- **JS→Wasm JIT は既定で有効。** gecko.js v0.0.3 の lowering パッチにより、JS は
+  実行時に Wasm へ lowering されブラウザの Wasm エンジンがコンパイルします
+  （PBL インタプリタ比 実測 3〜70 倍。それでもネイティブ JS よりは遅いです）。
+  `?env.GECKO_NOWASMJIT=1` で JIT を切り、PBL インタプリタだけで動かせます。
 - **実サイトには WISP プロキシが必要。** ブラウザからは生の TCP を開けないため、
   `http(s)://` は WISP 経由になります。`?wisp=wss://...` か `VITE_WISP_URL` で指定します。
   指定しなければ完全オフライン（`data:` / `about:` のみ）で、これはこれで成立します。
@@ -201,8 +222,30 @@ npm run build && npx vite preview --port 4173
 
 なお、**接続元のページが https なら wisp も `wss://` である必要があります**
 （mixed content）。ローカル開発では http + `ws://` で問題ありません。
-- **JIT なし。** エンジンは JS をインタプリタで実行するため、JS の重いサイトは遅くなります。
-  `?env.GECKO_NOWASMJIT=1` でエンジン内蔵の WASM JIT を切ることもできます。
+
+---
+
+## Web Search タスク
+
+「Web Search」ベンチマーク風の遊びを内蔵しています。お題の検索ワードが出るので、
+3D 画面の中のブラウザ（起動すると最初に Google が開きます）で実際に検索し、
+「これが答え」と思うページを開いて **このページを答えとして提出** を押します。
+
+提出されると、そのページの URL・タイトル・本文先頭が dev/preview サーバの
+`POST /api/judge` へ送られ、そこから **TypeSafe Jev** の CLI（`jev score`）を
+叩いて 0〜3 の段階で採点します（unrelated / weak / relevant / ideal）。
+採点結果と履歴は HUD のパネルに出ます。
+
+- 使い方: `npm run wisp` を立てて `?wisp=ws://127.0.0.1:5001/` で開き、
+  HUD の「WEB SEARCH タスク」が ON であることを確認するだけです
+  （お題はプリセットからランダム。自分で入力も、`?task=<word>` で固定もできます）
+- モードの ON/OFF は localStorage に残ります。OFF または `?websearch=0` なら
+  エンジンは従来どおりウェルカムページで起動します
+- jev は `~/.local/bin/jev` か PATH から探します（`JEV_BIN` で差し替え可）
+
+```bash
+npm run verify:websearch   # 起動→Google表示→提出→採点までを headless で検証
+```
 
 ---
 
@@ -219,7 +262,9 @@ npm run wisp            # WISP が必要な検証を回す前に起動してお�
 
 npm run verify          # 内蔵ブラウザ経路
 npm run verify:engine   # wasm エンジン経路（エンジン接続時のみ）
+npm run verify:webgl    # wasm エンジン GPU 合成 + コンテンツ WebGL（エンジン接続時のみ）
 npm run verify:wisp     # 自前 wisp 経由で実サイトが開けるか（wisp 起動時のみ）
+npm run verify:websearch # Web Search タスク（wisp + jev CLI が必要）
 ```
 
 スクリーンショットは `verify/shots/` に出ます。
@@ -248,6 +293,16 @@ npm run verify:wisp     # 自前 wisp 経由で実サイトが開けるか（wis
 
 エンジン側の入力検証は、組み込みページに「mousedown で青、keydown で赤」という目印を
 仕込んで判定しています。座標の決め打ちをしないので、ページ内容を変えても壊れません。
+
+### `verify/webgl.mjs` が証明していること
+
+| 検証 | 実測値 |
+| --- | --- |
+| エンジン起動 | GPU 合成（`GECKO_GPU=1` + `GECKO_GL_PASSTHROUGH=1`）で ready |
+| コンテンツの WebGL | `document.title` = `GL_OK:WebGL 2.0` |
+| テクスチャの元 | `liveSurface` かつ元 canvas 一致 |
+| フレーム供給 | 13 回 / 1.5s（毎フレーム再アップロード） |
+| `#screen` のサンプリング | `texImage2D` 例外なし・WebGL の緑 60000 px |
 
 ### 開発用ハンドル
 
@@ -279,9 +334,11 @@ src/three/                   3D シーン
   useScreenPointer.ts          レイキャスト入力と OrbitControls の調停
 src/ui/
   Hud.tsx                      HUD・住所欄・接続手順
+  WebSearchPanel.tsx           Web Search タスクのパネル（お題・提出・採点表示）
   KeyboardCapture.ts           キーボード横取りと IME
+src/websearch.ts               タスクモードの状態・お題・/api/judge クライアント
 scripts/link-engine.mjs        wasm エンジンの取り込み
-verify/                        ヘッドレス Chrome による端から端の検証
+verify/                        ヘッドレス Chrome による端から端の検証（screen / engine / webgl / wisp）
 ```
 
 ---
@@ -302,6 +359,12 @@ verify/                        ヘッドレス Chrome による端から端の�
   々面密度 2〜4% → 6〜11%、従来は欠落グリフ）。恒久対応は fork の CI ビルド
   （`stage-gre-min.sh` に CJK 焼き込みを追加済み、v0.0.2）で、`engine:link` の差し替えで
   置き換わります。
+- **コンテンツの WebGL は GPU 合成モード（`?env.GECKO_GPU=1&env.GECKO_GL_PASSTHROUGH=1`）
+  でのみ動きます**（理由は上の「実測済みの制約」）。また GPU 合成ではポップアップ
+  （メニュー・`<select>`）が別 canvas に描かれるため 3D 側の画面には出ません。
+  既定のソフトウェア合成でポップアップと引き換えに WebGL を諦めている、という関係です。
+  ポップアップも出すには、エンジン側が overlay canvas を本体へ合成するか、
+  アプリ側が 2 枚目のテクスチャとして重ねる必要があります（未実装）。
 - **エンジンの起動に 32MB の wasm を毎回ダウンロード**します。`Cache Storage` に入れれば
   2 回目以降は速くなります（未実装）。
 - **部屋の美術がまだ粗い。** 実測すると、ガラス周囲の面取りが 15px 幅でほぼ黒（0.02 linear）

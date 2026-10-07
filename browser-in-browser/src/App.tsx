@@ -9,6 +9,7 @@ import {
   SCREEN_RESOLUTION_WIDTH,
 } from './three/dimensions'
 import { isNavigable, type CursorKind, type ScreenStatus } from './screen/types'
+import { prewarmEngine } from './screen/GeckoSource'
 import { KeyboardCapture } from './ui/KeyboardCapture'
 import { Hud, type HudAddress } from './ui/Hud'
 import './styles.css'
@@ -40,6 +41,15 @@ export function App() {
   )
 
   const keyboard = useMemo(() => new KeyboardCapture(), [])
+
+  // 初回描画が落ち着いてから、エンジンの重い資産（bundle import + wasm）を
+  // 裏で温めておく。クリック時の待ち時間が資産ロード分だけ減る。
+  // ?noprewarm で切れる（自動検証が余計な負荷を受けないための抜け道）。
+  useEffect(() => {
+    if (new URLSearchParams(location.search).has('noprewarm')) return
+    const timer = window.setTimeout(prewarmEngine, 800)
+    return () => window.clearTimeout(timer)
+  }, [])
 
   useEffect(() => {
     runtime.setSource(source)
@@ -151,6 +161,7 @@ export function App() {
         detail={detail}
         engaged={engaged}
         address={address}
+        source={source}
         onSelect={handleSelect}
         onEngage={engage}
         onDisengage={disengage}
